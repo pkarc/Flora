@@ -434,7 +434,7 @@ def main(argv=None):
     p.add_argument('--vllm-batch', type=int, default=8, help='vllm backend: windows generated together.')
     p.add_argument('--vllm-gpu-util', type=float, default=0.85)
     p.add_argument('--vllm-max-len', type=int, default=16384)
-    p.add_argument('--vllm-lora-dtype', default='auto', help='auto, bfloat16 or float32 (the reference keeps the adapter in float32).')
+    p.add_argument('--vllm-lora-dtype', default='auto', choices=['auto', 'float16', 'bfloat16'], help='vLLM cannot hold the adapter in float32 (the reference does), so this path always differs numerically.')
     p.add_argument('--vllm-eager', action='store_true', help='Disable CUDA graphs.')
     p.add_argument('--no-fast-decode', action='store_true', help='Use the reference sequential decoder (slow).')
     args = p.parse_args(argv)

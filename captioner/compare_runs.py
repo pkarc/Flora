@@ -4,7 +4,8 @@
 
 Segments: matched pairs at IoU >= --iou, F1, and the unmatched segments with their provenance.
 Raw windows (runs made with --save-raw): per window, whether the input token count and the model output are
-identical; the first differences are printed. Windows are paired by (clip, scope_id).
+identical, split into first-pass and retry windows (retries only exist where the first pass was uncertain); the first
+differences are printed, first-pass ones first. Windows are paired by (clip, scope_id).
 """
 import argparse
 import json
@@ -56,15 +57,17 @@ def main(argv=None):
     ka = {(r['clip'], r['scope_id']): r for r in ra}
     kb = {(r['clip'], r['scope_id']): r for r in rb}
     common = sorted(set(ka) & set(kb))
-    same_tokens = sum(ka[k]['input_tokens'] == kb[k]['input_tokens'] for k in common)
-    same_output = sum(ka[k]['output'] == kb[k]['output'] for k in common)
+    retry = lambda k: 'retry' in k[1]
     print(f'raw windows: baseline {len(ra)}, candidate {len(rb)}, in common {len(common)}')
-    print(f'  same input token count: {same_tokens}/{len(common)}   identical output text: {same_output}/{len(common)}')
+    for label, keys in (('first pass', [k for k in common if not retry(k)]), ('retry    ', [k for k in common if retry(k)])):
+        tokens = sum(ka[k]['input_tokens'] == kb[k]['input_tokens'] for k in keys)
+        same = sum(ka[k]['output'] == kb[k]['output'] for k in keys)
+        print(f'  {label}: {len(keys)} windows | same input tokens {tokens} | identical output {same}')
     shown = 0
-    for k in common:
+    for k in sorted(common, key=lambda k: (retry(k), k)):
         if ka[k]['output'] != kb[k]['output'] and shown < args.show:
             shown += 1
-            print(f'  window {k}: tokens {ka[k]["input_tokens"]} vs {kb[k]["input_tokens"]}\n    baseline : {ka[k]["output"][:300]}\n    candidate: {kb[k]["output"][:300]}')
+            print(f'  differs ({"retry" if retry(k) else "first pass"}) {k}: tokens {ka[k]["input_tokens"]} vs {kb[k]["input_tokens"]}\n    baseline : {ka[k]["output"][:300]}\n    candidate: {kb[k]["output"][:300]}')
     return 0
 
 

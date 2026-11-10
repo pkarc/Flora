@@ -123,9 +123,9 @@ class Predictor:
     Each window is prepared and generated exactly as before; only the order of the work changes.
     """
 
-    def __init__(self, backend, videos, source, pool, bound, instruction, fast=True, verify=0, prefetch=1, batch_size=1):
+    def __init__(self, backend, videos, source, pool, bound, instruction, fast=True, verify=0, prefetch=1, batch_size=1, threads=1):
         self.backend, self.videos, self.source, self.pool, self.bound, self.instruction = backend, videos, source, pool, bound, instruction
-        self.fast, self.verify, self.prefetch, self.batch_size = fast, verify, prefetch, batch_size
+        self.fast, self.verify, self.prefetch, self.batch_size, self.threads = fast, verify, prefetch, batch_size, threads
         self.windows = 0
         self.raw = []
         self.timing = dict(decode=0.0, transport=0.0, processor=0.0, generate=0.0, wait=0.0)
@@ -139,8 +139,10 @@ class Predictor:
         started = time.monotonic()
         images = lv.frames_for(self.videos, wanted, mosaic=mosaic) if self.fast else reference_frames_for(self.videos, wanted, mosaic=mosaic)
         self._add('decode', started)
-        if self.fast and self.verify > 0:
-            self.verify -= 1
+        with self._lock:
+            check = self.fast and self.verify > 0
+            self.verify -= check
+        if check:
             if all(getattr(v, 'start_s', 0) == 0 for v in self.videos.values()):
                 slow = reference_frames_for(self.videos, wanted, mosaic=mosaic)
             else:
@@ -174,7 +176,7 @@ class Predictor:
                 yield result
             return
         pending, iterator = deque(), iter(payloads)
-        with ThreadPoolExecutor(max_workers=1) as executor:
+        with ThreadPoolExecutor(max_workers=max(1, self.threads)) as executor:
             try:
                 while True:
                     while len(pending) < self.prefetch:
@@ -259,11 +261,11 @@ def job_arguments(job):
     return canonical, resolved, yam32, instruction
 
 
-def segment_clip(backend, videos, pool, instruction, fast, verify, prefetch=1, batch_size=1):
+def segment_clip(backend, videos, pool, instruction, fast, verify, prefetch=1, batch_size=1, threads=1):
     main = videos['main']
     source = a.AnnotationSource(source_id='upload_' + main.sha256[:24], location=str(main.path), duration_s=main.duration_s, fps=float(main.rate))
     bound = dict(candidate_id='flora_final', checkpoint_sha256=MODELS['tempseg']['sha256'], model_io_contract=a.fine_window_profile(a.PROFILES[pool]).model_io_contract)
-    predictor = Predictor(backend, videos, source, pool, bound, instruction, fast, verify, prefetch, batch_size)
+    predictor = Predictor(backend, videos, source, pool, bound, instruction, fast, verify, prefetch, batch_size, threads)
     if len(videos) == 3:
         fine = a.FineSubtaskSegmenter(predictor=predictor, model_binding=bound, profile_id='robot_atomic_intent_v1', window_profile_id=a.PROFILES[pool], fail_on_unresolved=True, batch_concurrency=1, unresolved_stitch_tolerance_ticks=2, quality_policy=a.FineSegmentationQualityPolicy(drop_guard_only_segments=True))
         engine = a.HierarchicalSubtaskSegmenter(coarse_segmenter=a.NoCoarse(), fine_segmenter=fine, fine_prior_mode='none', fine_failure_policy='adaptive_fine_then_conservative_completion', fine_output_coverage_policy='allow_gaps', adaptive_fine_retry_max_windows=32)
@@ -297,7 +299,7 @@ def segment_job(backend, job, opts):
         if hasattr(backend, 'begin_clip'):
             backend.begin_clip(offset)
         try:
-            rows, predictor = segment_clip(backend, videos, pool, instruction, fast, opts.verify_decode if number == 0 else 0, opts.prefetch, opts.vllm_batch)
+            rows, predictor = segment_clip(backend, videos, pool, instruction, fast, opts.verify_decode if number == 0 else 0, opts.prefetch, opts.vllm_batch, opts.prep_threads)
         except Exception as error:
             if len(plans) == 1:
                 raise
@@ -427,6 +429,7 @@ def main(argv=None):
     p.add_argument('--direct-max-s', type=float, default=120.0, help='Videos up to this length run as one clip (cannot exceed 120). Lower it to test clipping.')
     p.add_argument('--verify-decode', type=int, default=0, metavar='N', help='Compare seek-based decoding with sequential decoding on the first N windows of each job.')
     p.add_argument('--prefetch', type=int, default=1, help='Windows prepared ahead on the CPU while the GPU generates (0 = sequential, as the reference pipeline).')
+    p.add_argument('--prep-threads', type=int, default=1, help='Threads preparing windows (decode, JPEG, processor). Use with --prefetch >= the batch size.')
     p.add_argument('--save-raw', action='store_true', help='Store each window\'s raw model output and input token count in the result (for comparing backends).')
     p.add_argument('--vllm-batch', type=int, default=8, help='vllm backend: windows generated together.')
     p.add_argument('--vllm-gpu-util', type=float, default=0.85)

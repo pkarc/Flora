@@ -60,6 +60,7 @@ class HFBackend:
 
     def infer(self, window, prepared):
         from batch_utils.models import generate
+        self.last_input_tokens = [int(prepared['input_ids'].shape[1])]
         return generate(self.model, self.proc, prepared, 1024)
 
 
@@ -75,6 +76,8 @@ class FakeBackend:
         self.events = [tuple(e) for e in spec.get('events', [[3.0, 7.0], [14.0, 22.0], [40.0, 41.0]])]
         self.garbage = set(spec.get('garbage_windows', []))
         self.delay_s = float(spec.get('infer_delay_s', 0))
+        if not spec.get('batch'):
+            self.infer_batch = None
         self.calls = 0
         self.offset_s = 0.0
 
@@ -86,6 +89,12 @@ class FakeBackend:
 
     def prepare(self, window, frames, pool, roles, instruction):
         return None
+
+    def infer_batch(self, windows, prepared):
+        """Only used when the spec sets "batch": true, to exercise the batched path of the Predictor."""
+        texts = [self.infer(w, p) for w, p in zip(windows, prepared)]
+        self.last_input_tokens = [1000 + w.window_index for w in windows]
+        return texts
 
     def infer(self, window, prepared):
         self.calls += 1
@@ -114,10 +123,11 @@ class Predictor:
     Each window is prepared and generated exactly as before; only the order of the work changes.
     """
 
-    def __init__(self, backend, videos, source, pool, bound, instruction, fast=True, verify=0, prefetch=1):
+    def __init__(self, backend, videos, source, pool, bound, instruction, fast=True, verify=0, prefetch=1, batch_size=1):
         self.backend, self.videos, self.source, self.pool, self.bound, self.instruction = backend, videos, source, pool, bound, instruction
-        self.fast, self.verify, self.prefetch = fast, verify, prefetch
+        self.fast, self.verify, self.prefetch, self.batch_size = fast, verify, prefetch, batch_size
         self.windows = 0
+        self.raw = []
         self.timing = dict(decode=0.0, transport=0.0, processor=0.0, generate=0.0, wait=0.0)
         self._lock = threading.Lock()
 
@@ -190,13 +200,31 @@ class Predictor:
         from flora_runtime.video_segmentation.fine_subtask import FINE_RESPONSE_SCHEMA
         if request['source']['source_id'] != self.source.source_id or request['model_binding'] != self.bound:
             raise RuntimeError('Production request binding changed')
-        predictions = []
-        for window, prepared in self._prepared(request['windows']):
+        predictions, chunk = [], []
+        batched = callable(getattr(self.backend, 'infer_batch', None))
+        size = self.batch_size if batched else 1
+
+        def flush():
+            if not chunk:
+                return
             started = time.monotonic()
-            text = self.backend.infer(window, prepared)
+            if batched:
+                texts = self.backend.infer_batch([w for w, _ in chunk], [p for _, p in chunk])
+            else:
+                texts = [self.backend.infer(*chunk[0])]
             self._add('generate', started)
-            predictions.append(dict(scope_id=window.scope_id, prediction_json=text))
-            self.windows += 1
+            tokens = getattr(self.backend, 'last_input_tokens', None) or [None] * len(chunk)
+            for (window, _), text, n in zip(chunk, texts, tokens):
+                predictions.append(dict(scope_id=window.scope_id, prediction_json=text))
+                self.raw.append(dict(scope_id=window.scope_id, window_index=window.window_index, view_start_s=window.requested_view_start_us / 1000000, input_tokens=n, output=text))
+            self.windows += len(chunk)
+            chunk.clear()
+
+        for item in self._prepared(request['windows']):
+            chunk.append(item)
+            if len(chunk) >= size:
+                flush()
+        flush()
         return dict(schema_version=FINE_RESPONSE_SCHEMA, source_id=self.source.source_id, model_io_contract=self.bound['model_io_contract'], model_binding=self.bound, predictions=predictions)
 
 
@@ -231,11 +259,11 @@ def job_arguments(job):
     return canonical, resolved, yam32, instruction
 
 
-def segment_clip(backend, videos, pool, instruction, fast, verify, prefetch=1):
+def segment_clip(backend, videos, pool, instruction, fast, verify, prefetch=1, batch_size=1):
     main = videos['main']
     source = a.AnnotationSource(source_id='upload_' + main.sha256[:24], location=str(main.path), duration_s=main.duration_s, fps=float(main.rate))
     bound = dict(candidate_id='flora_final', checkpoint_sha256=MODELS['tempseg']['sha256'], model_io_contract=a.fine_window_profile(a.PROFILES[pool]).model_io_contract)
-    predictor = Predictor(backend, videos, source, pool, bound, instruction, fast, verify, prefetch)
+    predictor = Predictor(backend, videos, source, pool, bound, instruction, fast, verify, prefetch, batch_size)
     if len(videos) == 3:
         fine = a.FineSubtaskSegmenter(predictor=predictor, model_binding=bound, profile_id='robot_atomic_intent_v1', window_profile_id=a.PROFILES[pool], fail_on_unresolved=True, batch_concurrency=1, unresolved_stitch_tolerance_ticks=2, quality_policy=a.FineSegmentationQualityPolicy(drop_guard_only_segments=True))
         engine = a.HierarchicalSubtaskSegmenter(coarse_segmenter=a.NoCoarse(), fine_segmenter=fine, fine_prior_mode='none', fine_failure_policy='adaptive_fine_then_conservative_completion', fine_output_coverage_policy='allow_gaps', adaptive_fine_retry_max_windows=32)
@@ -262,19 +290,20 @@ def segment_job(backend, job, opts):
         check_synchronized(videos)
     main_index = indexes['main']
     duration_s = main_index.duration_us / 1000000
-    per_clip, spans, windows = [], [], 0
+    per_clip, spans, windows, raw = [], [], 0, []
     timing = dict(decode=0.0, transport=0.0, processor=0.0, generate=0.0, wait=0.0)
     for number, videos in enumerate(plans):
         offset = getattr(videos['main'], 'start_s', 0.0)
         if hasattr(backend, 'begin_clip'):
             backend.begin_clip(offset)
         try:
-            rows, predictor = segment_clip(backend, videos, pool, instruction, fast, opts.verify_decode if number == 0 else 0, opts.prefetch)
+            rows, predictor = segment_clip(backend, videos, pool, instruction, fast, opts.verify_decode if number == 0 else 0, opts.prefetch, opts.vllm_batch)
         except Exception as error:
             if len(plans) == 1:
                 raise
             raise RuntimeError(f'clip {number + 1}/{len(plans)} ({offset:.1f}-{offset + videos["main"].duration_s:.1f} s) failed: {type(error).__name__}: {error}') from error
         windows += predictor.windows
+        raw.extend(dict(r, clip=number, view_start_s=round(r['view_start_s'] + offset, 6)) for r in predictor.raw)
         for key, value in predictor.timing.items():
             timing[key] += value
         per_clip.append([dict(r, start_s=round(r['start_s'] + offset, 6), end_s=round(r['end_s'] + offset, 6)) for r in rows])
@@ -289,6 +318,8 @@ def segment_job(backend, job, opts):
         if not (math.isfinite(r['start_s']) and math.isfinite(r['end_s']) and 0 <= r['start_s'] < r['end_s'] <= duration_s + 0.001):
             raise RuntimeError('The pipeline returned an invalid segment interval.')
     result = dict(schema_version=SCHEMA, duration_s=duration_s, profile=canonical, camera_roles=list(paths), segments=rows, windows=windows, decode_s=round(timing['decode'], 2), timing_s={k: round(v, 2) for k, v in timing.items()}, prefetch=opts.prefetch, decoder='seek' if fast else 'reference')
+    if opts.save_raw:
+        result['raw_windows'] = raw
     if len(plans) > 1:
         result.update(clips=[dict(index=i, start_s=round(a_, 3), end_s=round(b_, 3)) for i, (a_, b_) in enumerate(spans)], merge=merge)
     return dict(result, model_revisions=dict(tempseg=MODELS['tempseg'], tempseg_base=MODELS['tempseg_base']), input_sha256={role: ix.sha256 for role, ix in indexes.items()})
@@ -374,10 +405,19 @@ class Worker:
         runtime_event('worker_stopped')
 
 
+def make_backend(args):
+    if args.backend == 'fake':
+        return FakeBackend(args.fake_spec)
+    if args.backend == 'vllm':
+        from vllm_backend import VLLMBackend
+        return VLLMBackend(args.vllm_gpu_util, args.vllm_max_len, args.vllm_lora_dtype, args.vllm_eager)
+    return HFBackend()
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description='FLORA TempSeg-only worker: watches a folder and writes action segments without captions.')
     p.add_argument('--watch', type=Path, required=True, help='Work folder (inbox/, out/, ... are created inside).')
-    p.add_argument('--backend', choices=['hf', 'fake'], default='hf')
+    p.add_argument('--backend', choices=['hf', 'vllm', 'fake'], default='hf')
     p.add_argument('--fake-spec', type=Path, help='fake backend: JSON {"events": [[s, e], ...], "garbage_windows": [i, ...]}.')
     p.add_argument('--once', action='store_true', help='Process what is in inbox/ and exit.')
     p.add_argument('--poll-interval', type=float, default=2.0)
@@ -387,11 +427,17 @@ def main(argv=None):
     p.add_argument('--direct-max-s', type=float, default=120.0, help='Videos up to this length run as one clip (cannot exceed 120). Lower it to test clipping.')
     p.add_argument('--verify-decode', type=int, default=0, metavar='N', help='Compare seek-based decoding with sequential decoding on the first N windows of each job.')
     p.add_argument('--prefetch', type=int, default=1, help='Windows prepared ahead on the CPU while the GPU generates (0 = sequential, as the reference pipeline).')
+    p.add_argument('--save-raw', action='store_true', help='Store each window\'s raw model output and input token count in the result (for comparing backends).')
+    p.add_argument('--vllm-batch', type=int, default=8, help='vllm backend: windows generated together.')
+    p.add_argument('--vllm-gpu-util', type=float, default=0.85)
+    p.add_argument('--vllm-max-len', type=int, default=16384)
+    p.add_argument('--vllm-lora-dtype', default='auto', help='auto, bfloat16 or float32 (the reference keeps the adapter in float32).')
+    p.add_argument('--vllm-eager', action='store_true', help='Disable CUDA graphs.')
     p.add_argument('--no-fast-decode', action='store_true', help='Use the reference sequential decoder (slow).')
     args = p.parse_args(argv)
     try:
         root = args.watch.expanduser().resolve()
-        worker = Worker(root, FakeBackend(args.fake_spec) if args.backend == 'fake' else HFBackend(), args)
+        worker = Worker(root, make_backend(args), args)
         lock = open(root / '.worker.lock', 'w')
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

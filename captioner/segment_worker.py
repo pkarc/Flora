@@ -26,7 +26,10 @@ import re
 import signal
 import sys
 import time
+import threading
 import traceback
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 from batch_utils.api import _PROFILES
 from batch_utils.bootstrap import production as a
@@ -49,11 +52,15 @@ class HFBackend:
         self.session = Session()
         self.model, self.proc = self.session.load('tempseg')
 
-    def infer(self, window, frames, pool, roles, instruction):
-        from batch_utils.models import generate
+    def prepare(self, window, frames, pool, roles, instruction):
+        """CPU only (processor); safe to run while the GPU generates another window."""
         from batch_utils.preprocessing import temporal_inputs
         inputs, _ = temporal_inputs(frames, window, pool, self.proc, roles, instruction)
-        return generate(self.model, self.proc, inputs, 1024)
+        return inputs
+
+    def infer(self, window, prepared):
+        from batch_utils.models import generate
+        return generate(self.model, self.proc, prepared, 1024)
 
 
 class FakeBackend:
@@ -67,6 +74,7 @@ class FakeBackend:
         spec = json.loads(Path(spec_path).read_text()) if spec_path else {}
         self.events = [tuple(e) for e in spec.get('events', [[3.0, 7.0], [14.0, 22.0], [40.0, 41.0]])]
         self.garbage = set(spec.get('garbage_windows', []))
+        self.delay_s = float(spec.get('infer_delay_s', 0))
         self.calls = 0
         self.offset_s = 0.0
 
@@ -76,8 +84,12 @@ class FakeBackend:
     def begin_clip(self, offset_s):
         self.offset_s = offset_s
 
-    def infer(self, window, frames, pool, roles, instruction):
+    def prepare(self, window, frames, pool, roles, instruction):
+        return None
+
+    def infer(self, window, prepared):
         self.calls += 1
+        time.sleep(self.delay_s)
         if window.window_index in self.garbage:
             return 'not json'
         origin_us = window.requested_view_start_us
@@ -96,18 +108,27 @@ class FakeBackend:
 
 
 class Predictor:
-    """Mirror of batch_utils.pipeline.Predictor with the model call behind a backend and seek-based decoding."""
+    """Mirror of batch_utils.pipeline.Predictor with the model call behind a backend and seek-based decoding.
 
-    def __init__(self, backend, videos, source, pool, bound, instruction, fast=True, verify=0):
+    With prefetch=1 the next window is decoded and preprocessed in a thread while the current one is generated.
+    Each window is prepared and generated exactly as before; only the order of the work changes.
+    """
+
+    def __init__(self, backend, videos, source, pool, bound, instruction, fast=True, verify=0, prefetch=1):
         self.backend, self.videos, self.source, self.pool, self.bound, self.instruction = backend, videos, source, pool, bound, instruction
-        self.fast, self.verify = fast, verify
+        self.fast, self.verify, self.prefetch = fast, verify, prefetch
         self.windows = 0
-        self.decode_s = 0.0
+        self.timing = dict(decode=0.0, transport=0.0, processor=0.0, generate=0.0, wait=0.0)
+        self._lock = threading.Lock()
+
+    def _add(self, key, started):
+        with self._lock:
+            self.timing[key] += time.monotonic() - started
 
     def _frames(self, wanted, mosaic):
         started = time.monotonic()
         images = lv.frames_for(self.videos, wanted, mosaic=mosaic) if self.fast else reference_frames_for(self.videos, wanted, mosaic=mosaic)
-        self.decode_s += time.monotonic() - started
+        self._add('decode', started)
         if self.fast and self.verify > 0:
             self.verify -= 1
             if all(getattr(v, 'start_s', 0) == 0 for v in self.videos.values()):
@@ -119,20 +140,61 @@ class Predictor:
             runtime_event('decode_verified', frames=len(images))
         return images
 
+    def _prepare(self, payload):
+        window = a.window_from_payload(payload, self.source)
+        plan = a.temporal_frame_plan(window, list(self.videos['main'].pts_us))
+        mosaic = 'Dex' if self.pool in ('dex', 'tianji') else 'YAM'
+        images = self._frames(set(plan['source_frame_indices']), mosaic)
+        if self.pool == 'human':
+            started = time.monotonic()
+            images = human_transport(images)
+            self._add('transport', started)
+        frames = [images[i] for i in plan['source_frame_indices']]
+        started = time.monotonic()
+        prepared = self.backend.prepare(window, frames, self.pool, list(self.videos), self.instruction)
+        self._add('processor', started)
+        return window, prepared
+
+    def _prepared(self, payloads):
+        if self.prefetch <= 0:
+            for payload in payloads:
+                started = time.monotonic()
+                result = self._prepare(payload)
+                self._add('wait', started)
+                yield result
+            return
+        pending, iterator = deque(), iter(payloads)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            try:
+                while True:
+                    while len(pending) < self.prefetch:
+                        payload = next(iterator, None)
+                        if payload is None:
+                            break
+                        pending.append(executor.submit(self._prepare, payload))
+                    if not pending:
+                        return
+                    started = time.monotonic()
+                    result = pending.popleft().result()
+                    self._add('wait', started)
+                    # queue the next window before the caller starts generating this one
+                    payload = next(iterator, None)
+                    if payload is not None:
+                        pending.append(executor.submit(self._prepare, payload))
+                    yield result
+            finally:
+                for future in pending:
+                    future.cancel()
+
     def predict(self, request):
         from flora_runtime.video_segmentation.fine_subtask import FINE_RESPONSE_SCHEMA
         if request['source']['source_id'] != self.source.source_id or request['model_binding'] != self.bound:
             raise RuntimeError('Production request binding changed')
         predictions = []
-        for payload in request['windows']:
-            window = a.window_from_payload(payload, self.source)
-            plan = a.temporal_frame_plan(window, list(self.videos['main'].pts_us))
-            mosaic = 'Dex' if self.pool in ('dex', 'tianji') else 'YAM'
-            images = self._frames(set(plan['source_frame_indices']), mosaic)
-            if self.pool == 'human':
-                images = human_transport(images)
-            frames = [images[i] for i in plan['source_frame_indices']]
-            text = self.backend.infer(window, frames, self.pool, list(self.videos), self.instruction)
+        for window, prepared in self._prepared(request['windows']):
+            started = time.monotonic()
+            text = self.backend.infer(window, prepared)
+            self._add('generate', started)
             predictions.append(dict(scope_id=window.scope_id, prediction_json=text))
             self.windows += 1
         return dict(schema_version=FINE_RESPONSE_SCHEMA, source_id=self.source.source_id, model_io_contract=self.bound['model_io_contract'], model_binding=self.bound, predictions=predictions)
@@ -169,11 +231,11 @@ def job_arguments(job):
     return canonical, resolved, yam32, instruction
 
 
-def segment_clip(backend, videos, pool, instruction, fast, verify):
+def segment_clip(backend, videos, pool, instruction, fast, verify, prefetch=1):
     main = videos['main']
     source = a.AnnotationSource(source_id='upload_' + main.sha256[:24], location=str(main.path), duration_s=main.duration_s, fps=float(main.rate))
     bound = dict(candidate_id='flora_final', checkpoint_sha256=MODELS['tempseg']['sha256'], model_io_contract=a.fine_window_profile(a.PROFILES[pool]).model_io_contract)
-    predictor = Predictor(backend, videos, source, pool, bound, instruction, fast, verify)
+    predictor = Predictor(backend, videos, source, pool, bound, instruction, fast, verify, prefetch)
     if len(videos) == 3:
         fine = a.FineSubtaskSegmenter(predictor=predictor, model_binding=bound, profile_id='robot_atomic_intent_v1', window_profile_id=a.PROFILES[pool], fail_on_unresolved=True, batch_concurrency=1, unresolved_stitch_tolerance_ticks=2, quality_policy=a.FineSegmentationQualityPolicy(drop_guard_only_segments=True))
         engine = a.HierarchicalSubtaskSegmenter(coarse_segmenter=a.NoCoarse(), fine_segmenter=fine, fine_prior_mode='none', fine_failure_policy='adaptive_fine_then_conservative_completion', fine_output_coverage_policy='allow_gaps', adaptive_fine_retry_max_windows=32)
@@ -200,19 +262,21 @@ def segment_job(backend, job, opts):
         check_synchronized(videos)
     main_index = indexes['main']
     duration_s = main_index.duration_us / 1000000
-    per_clip, spans, windows, decode_s = [], [], 0, 0.0
+    per_clip, spans, windows = [], [], 0
+    timing = dict(decode=0.0, transport=0.0, processor=0.0, generate=0.0, wait=0.0)
     for number, videos in enumerate(plans):
         offset = getattr(videos['main'], 'start_s', 0.0)
         if hasattr(backend, 'begin_clip'):
             backend.begin_clip(offset)
         try:
-            rows, predictor = segment_clip(backend, videos, pool, instruction, fast, opts.verify_decode if number == 0 else 0)
+            rows, predictor = segment_clip(backend, videos, pool, instruction, fast, opts.verify_decode if number == 0 else 0, opts.prefetch)
         except Exception as error:
             if len(plans) == 1:
                 raise
             raise RuntimeError(f'clip {number + 1}/{len(plans)} ({offset:.1f}-{offset + videos["main"].duration_s:.1f} s) failed: {type(error).__name__}: {error}') from error
         windows += predictor.windows
-        decode_s += predictor.decode_s
+        for key, value in predictor.timing.items():
+            timing[key] += value
         per_clip.append([dict(r, start_s=round(r['start_s'] + offset, 6), end_s=round(r['end_s'] + offset, 6)) for r in rows])
         spans.append((offset, offset + videos['main'].duration_s))
         if len(plans) > 1:
@@ -224,7 +288,7 @@ def segment_job(backend, job, opts):
     for r in rows:
         if not (math.isfinite(r['start_s']) and math.isfinite(r['end_s']) and 0 <= r['start_s'] < r['end_s'] <= duration_s + 0.001):
             raise RuntimeError('The pipeline returned an invalid segment interval.')
-    result = dict(schema_version=SCHEMA, duration_s=duration_s, profile=canonical, camera_roles=list(paths), segments=rows, windows=windows, decode_s=round(decode_s, 2), decoder='seek' if fast else 'reference')
+    result = dict(schema_version=SCHEMA, duration_s=duration_s, profile=canonical, camera_roles=list(paths), segments=rows, windows=windows, decode_s=round(timing['decode'], 2), timing_s={k: round(v, 2) for k, v in timing.items()}, prefetch=opts.prefetch, decoder='seek' if fast else 'reference')
     if len(plans) > 1:
         result.update(clips=[dict(index=i, start_s=round(a_, 3), end_s=round(b_, 3)) for i, (a_, b_) in enumerate(spans)], merge=merge)
     return dict(result, model_revisions=dict(tempseg=MODELS['tempseg'], tempseg_base=MODELS['tempseg_base']), input_sha256={role: ix.sha256 for role, ix in indexes.items()})
@@ -322,6 +386,7 @@ def main(argv=None):
     p.add_argument('--overlap-s', type=float, default=20.0, help='Overlap between consecutive clips; segments are merged inside it.')
     p.add_argument('--direct-max-s', type=float, default=120.0, help='Videos up to this length run as one clip (cannot exceed 120). Lower it to test clipping.')
     p.add_argument('--verify-decode', type=int, default=0, metavar='N', help='Compare seek-based decoding with sequential decoding on the first N windows of each job.')
+    p.add_argument('--prefetch', type=int, default=1, help='Windows prepared ahead on the CPU while the GPU generates (0 = sequential, as the reference pipeline).')
     p.add_argument('--no-fast-decode', action='store_true', help='Use the reference sequential decoder (slow).')
     args = p.parse_args(argv)
     try:

@@ -6,6 +6,8 @@ Folder layout under --watch DIR (created on start):
   out/         NAME.json results
   done/        finished job files        failed/   rejected job files + NAME.error.txt
 
+Videos longer than 120 s are cut into overlapping virtual clips (no re-encoding) and the segments merged.
+
 Job file (relative paths are resolved against inbox/; absolute paths are fine):
   {"video": "main.mp4", "profile": "human"}
   {"video": "main.mp4", "left_wrist": "l.mp4", "right_wrist": "r.mp4", "profile": "yam", "yam32": false}
@@ -26,17 +28,17 @@ import sys
 import time
 import traceback
 
-from batch_utils.api import DataEnginePipeline
+from batch_utils.api import _PROFILES
 from batch_utils.bootstrap import production as a
 from batch_utils.config import MODELS, PROFILE_POOLS
-from batch_utils.media import frames_for
+from batch_utils.media import InputError, check_synchronized, frames_for as reference_frames_for, probe
 from batch_utils.models import runtime_event
 from batch_utils.preprocessing import human_transport
+import long_video as lv
 
 JOB_ALLOWED = {'video', 'profile', 'left_wrist', 'right_wrist', 'yam32', 'instruction'}
 JOB_ID = re.compile('[A-Za-z0-9][A-Za-z0-9_.-]{0,95}')
 SCHEMA = 'flora_segments_v1'
-TICK_S = 1 / 20
 
 
 class HFBackend:
@@ -66,9 +68,13 @@ class FakeBackend:
         self.events = [tuple(e) for e in spec.get('events', [[3.0, 7.0], [14.0, 22.0], [40.0, 41.0]])]
         self.garbage = set(spec.get('garbage_windows', []))
         self.calls = 0
+        self.offset_s = 0.0
 
     def load(self):
         pass
+
+    def begin_clip(self, offset_s):
+        self.offset_s = offset_s
 
     def infer(self, window, frames, pool, roles, instruction):
         self.calls += 1
@@ -77,9 +83,11 @@ class FakeBackend:
         origin_us = window.requested_view_start_us
         rows = []
         for start_s, end_s in self.events:
-            s = round((start_s * 1e6 - origin_us) / 5e4)
-            e = round((end_s * 1e6 - origin_us) / 5e4)
-            lo, ro = s < window.valid_start_tick, e > window.valid_end_tick
+            s = round(((start_s - self.offset_s) * 1e6 - origin_us) / 5e4)
+            e = round(((end_s - self.offset_s) * 1e6 - origin_us) / 5e4)
+            # the model cannot see past the video's own ends: nothing continues beyond them
+            lo = s < window.valid_start_tick and window.valid_start_us > 0
+            ro = e > window.valid_end_tick and window.valid_end_us < window.video_end_us
             s, e = max(s, window.valid_start_tick), min(e, window.valid_end_tick)
             if s < e and s < window.core_end_tick and e > window.core_start_tick:
                 rows.append((s, e, lo, ro))
@@ -88,11 +96,28 @@ class FakeBackend:
 
 
 class Predictor:
-    """Mirror of batch_utils.pipeline.Predictor with the model call behind a backend."""
+    """Mirror of batch_utils.pipeline.Predictor with the model call behind a backend and seek-based decoding."""
 
-    def __init__(self, backend, videos, source, pool, bound, instruction):
+    def __init__(self, backend, videos, source, pool, bound, instruction, fast=True, verify=0):
         self.backend, self.videos, self.source, self.pool, self.bound, self.instruction = backend, videos, source, pool, bound, instruction
+        self.fast, self.verify = fast, verify
         self.windows = 0
+        self.decode_s = 0.0
+
+    def _frames(self, wanted, mosaic):
+        started = time.monotonic()
+        images = lv.frames_for(self.videos, wanted, mosaic=mosaic) if self.fast else reference_frames_for(self.videos, wanted, mosaic=mosaic)
+        self.decode_s += time.monotonic() - started
+        if self.fast and self.verify > 0:
+            self.verify -= 1
+            if all(getattr(v, 'start_s', 0) == 0 for v in self.videos.values()):
+                slow = reference_frames_for(self.videos, wanted, mosaic=mosaic)
+            else:
+                slow = lv.frames_for(self.videos, wanted, mosaic=mosaic, seek=False)
+            if set(slow) != set(images) or any(slow[i].size != images[i].size or slow[i].tobytes() != images[i].tobytes() for i in images):
+                raise RuntimeError('Seek-based decoding differs from sequential decoding; rerun with --no-fast-decode.')
+            runtime_event('decode_verified', frames=len(images))
+        return images
 
     def predict(self, request):
         from flora_runtime.video_segmentation.fine_subtask import FINE_RESPONSE_SCHEMA
@@ -103,7 +128,7 @@ class Predictor:
             window = a.window_from_payload(payload, self.source)
             plan = a.temporal_frame_plan(window, list(self.videos['main'].pts_us))
             mosaic = 'Dex' if self.pool in ('dex', 'tianji') else 'YAM'
-            images = frames_for(self.videos, set(plan['source_frame_indices']), mosaic=mosaic)
+            images = self._frames(set(plan['source_frame_indices']), mosaic)
             if self.pool == 'human':
                 images = human_transport(images)
             frames = [images[i] for i in plan['source_frame_indices']]
@@ -113,13 +138,42 @@ class Predictor:
         return dict(schema_version=FINE_RESPONSE_SCHEMA, source_id=self.source.source_id, model_io_contract=self.bound['model_io_contract'], model_binding=self.bound, predictions=predictions)
 
 
-def segment_job(backend, job):
-    videos, canonical = DataEnginePipeline._inputs(job['video'], job.get('profile', 'human'), job.get('left_wrist'), job.get('right_wrist'), job.get('yam32', False), job.get('instruction', ''))
-    pool = 'yam32' if job.get('yam32') else PROFILE_POOLS[canonical]
+def job_arguments(job):
+    """Same argument checks as DataEnginePipeline._inputs, without probing the files."""
+    profile, left, right = job.get('profile', 'human'), job.get('left_wrist'), job.get('right_wrist')
+    yam32, instruction = job.get('yam32', False), job.get('instruction', '')
+    if not isinstance(profile, str) or profile.lower() not in _PROFILES:
+        raise InputError('profile must be human, yam, dex, or tianji')
+    canonical = _PROFILES[profile.lower()]
+    if bool(left) != bool(right):
+        raise InputError('Provide both left and right wrist videos together.')
+    if canonical == 'Human' and left:
+        raise InputError('The human profile accepts one video.')
+    if not isinstance(yam32, bool):
+        raise InputError('yam32 must be true or false.')
+    if yam32 and (canonical != 'YAM' or not left):
+        raise InputError('yam32 requires YAM and all three camera views.')
+    if not isinstance(instruction, str) or len(instruction.strip()) > 2000:
+        raise InputError('instruction must be a string of at most 2000 characters.')
+    paths = {'main': job['video']}
+    if left:
+        paths.update(left_wrist=left, right_wrist=right)
+    resolved = {}
+    for role, value in paths.items():
+        if not isinstance(value, (str, Path)) or not str(value).strip():
+            raise InputError('Each camera path must be a nonempty local path.')
+        path = Path(value).expanduser().resolve(strict=True)
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise InputError('Each input must be a nonempty local video file.')
+        resolved[role] = path
+    return canonical, resolved, yam32, instruction
+
+
+def segment_clip(backend, videos, pool, instruction, fast, verify):
     main = videos['main']
     source = a.AnnotationSource(source_id='upload_' + main.sha256[:24], location=str(main.path), duration_s=main.duration_s, fps=float(main.rate))
     bound = dict(candidate_id='flora_final', checkpoint_sha256=MODELS['tempseg']['sha256'], model_io_contract=a.fine_window_profile(a.PROFILES[pool]).model_io_contract)
-    predictor = Predictor(backend, videos, source, pool, bound, job.get('instruction', ''))
+    predictor = Predictor(backend, videos, source, pool, bound, instruction, fast, verify)
     if len(videos) == 3:
         fine = a.FineSubtaskSegmenter(predictor=predictor, model_binding=bound, profile_id='robot_atomic_intent_v1', window_profile_id=a.PROFILES[pool], fail_on_unresolved=True, batch_concurrency=1, unresolved_stitch_tolerance_ticks=2, quality_policy=a.FineSegmentationQualityPolicy(drop_guard_only_segments=True))
         engine = a.HierarchicalSubtaskSegmenter(coarse_segmenter=a.NoCoarse(), fine_segmenter=fine, fine_prior_mode='none', fine_failure_policy='adaptive_fine_then_conservative_completion', fine_output_coverage_policy='allow_gaps', adaptive_fine_retry_max_windows=32)
@@ -127,10 +181,53 @@ def segment_job(backend, job):
         engine = a.production_segmenter(predictor, bound, pool)
     segments = asyncio.run(engine.segment_async(source))
     rows = [dict(start_s=s.span.start_s, end_s=s.span.end_s, segmentation_provenance=dict(s.metadata).get('segmentation_provenance', 'fine')) for s in segments]
+    return rows, predictor
+
+
+def segment_job(backend, job, opts):
+    canonical, paths, yam32, instruction = job_arguments(job)
+    pool = 'yam32' if yam32 else PROFILE_POOLS[canonical]
+    indexes = {role: lv.index_video(path) for role, path in paths.items()}
+    plans = lv.plan_clips(indexes, opts.clip_s, opts.overlap_s, opts.direct_max_s)
+    fast = not opts.no_fast_decode
+    if len(plans) == 1:
+        # one clip = the whole video: confirm our packet index equals the reference probe, else use the reference path
+        reference = {role: probe(path) for role, path in paths.items()}
+        if not all(reference[r].pts_us == plans[0][r].pts_us and reference[r].duration_us == plans[0][r].duration_us for r in reference):
+            runtime_event('index_differs_from_probe', note='using the reference decoder for this job')
+            plans, fast = [reference], False
+    for videos in plans:
+        check_synchronized(videos)
+    main_index = indexes['main']
+    duration_s = main_index.duration_us / 1000000
+    per_clip, spans, windows, decode_s = [], [], 0, 0.0
+    for number, videos in enumerate(plans):
+        offset = getattr(videos['main'], 'start_s', 0.0)
+        if hasattr(backend, 'begin_clip'):
+            backend.begin_clip(offset)
+        try:
+            rows, predictor = segment_clip(backend, videos, pool, instruction, fast, opts.verify_decode if number == 0 else 0)
+        except Exception as error:
+            if len(plans) == 1:
+                raise
+            raise RuntimeError(f'clip {number + 1}/{len(plans)} ({offset:.1f}-{offset + videos["main"].duration_s:.1f} s) failed: {type(error).__name__}: {error}') from error
+        windows += predictor.windows
+        decode_s += predictor.decode_s
+        per_clip.append([dict(r, start_s=round(r['start_s'] + offset, 6), end_s=round(r['end_s'] + offset, 6)) for r in rows])
+        spans.append((offset, offset + videos['main'].duration_s))
+        if len(plans) > 1:
+            runtime_event('clip_done', clip=number + 1, of=len(plans), segments=len(rows), windows=predictor.windows)
+    if len(plans) == 1:
+        rows, merge = per_clip[0], []
+    else:
+        rows, merge = lv.merge_clips(per_clip, spans)
     for r in rows:
-        if not (math.isfinite(r['start_s']) and math.isfinite(r['end_s']) and 0 <= r['start_s'] < r['end_s'] <= main.duration_s + 0.001):
+        if not (math.isfinite(r['start_s']) and math.isfinite(r['end_s']) and 0 <= r['start_s'] < r['end_s'] <= duration_s + 0.001):
             raise RuntimeError('The pipeline returned an invalid segment interval.')
-    return dict(schema_version=SCHEMA, duration_s=main.duration_s, profile=canonical, camera_roles=list(videos), segments=rows, windows=predictor.windows, model_revisions=dict(tempseg=MODELS['tempseg'], tempseg_base=MODELS['tempseg_base']), input_sha256={role: v.sha256 for role, v in videos.items()})
+    result = dict(schema_version=SCHEMA, duration_s=duration_s, profile=canonical, camera_roles=list(paths), segments=rows, windows=windows, decode_s=round(decode_s, 2), decoder='seek' if fast else 'reference')
+    if len(plans) > 1:
+        result.update(clips=[dict(index=i, start_s=round(a_, 3), end_s=round(b_, 3)) for i, (a_, b_) in enumerate(spans)], merge=merge)
+    return dict(result, model_revisions=dict(tempseg=MODELS['tempseg'], tempseg_base=MODELS['tempseg_base']), input_sha256={role: ix.sha256 for role, ix in indexes.items()})
 
 
 def read_job(path, base):
@@ -154,8 +251,8 @@ def write_atomic(path, payload):
 
 class Worker:
 
-    def __init__(self, root, backend, settle_s=1.0):
-        self.root, self.backend, self.settle_s = root, backend, settle_s
+    def __init__(self, root, backend, opts):
+        self.root, self.backend, self.opts, self.settle_s = root, backend, opts, opts.settle
         self.dirs = {n: root / n for n in ('inbox', 'processing', 'out', 'done', 'failed')}
         for d in self.dirs.values():
             d.mkdir(parents=True, exist_ok=True)
@@ -187,7 +284,7 @@ class Worker:
                 os.replace(claimed, self.dirs['done'] / claimed.name)
                 return True
             runtime_event('job_start', id=name)
-            result = segment_job(self.backend, read_job(claimed, inbox_path.parent))
+            result = segment_job(self.backend, read_job(claimed, inbox_path.parent), self.opts)
             result = dict(id=name, **result, elapsed_s=round(time.monotonic() - started, 2))
             write_atomic(out, result)
             os.replace(claimed, self.dirs['done'] / claimed.name)
@@ -221,10 +318,15 @@ def main(argv=None):
     p.add_argument('--once', action='store_true', help='Process what is in inbox/ and exit.')
     p.add_argument('--poll-interval', type=float, default=2.0)
     p.add_argument('--settle', type=float, default=1.0, help='Ignore job files modified less than this many seconds ago.')
+    p.add_argument('--clip-s', type=float, default=100.0, help='Videos beyond 120 s / 7200 frames are cut into virtual clips of this length (no re-encoding).')
+    p.add_argument('--overlap-s', type=float, default=20.0, help='Overlap between consecutive clips; segments are merged inside it.')
+    p.add_argument('--direct-max-s', type=float, default=120.0, help='Videos up to this length run as one clip (cannot exceed 120). Lower it to test clipping.')
+    p.add_argument('--verify-decode', type=int, default=0, metavar='N', help='Compare seek-based decoding with sequential decoding on the first N windows of each job.')
+    p.add_argument('--no-fast-decode', action='store_true', help='Use the reference sequential decoder (slow).')
     args = p.parse_args(argv)
     try:
         root = args.watch.expanduser().resolve()
-        worker = Worker(root, FakeBackend(args.fake_spec) if args.backend == 'fake' else HFBackend(), args.settle)
+        worker = Worker(root, FakeBackend(args.fake_spec) if args.backend == 'fake' else HFBackend(), args)
         lock = open(root / '.worker.lock', 'w')
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

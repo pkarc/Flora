@@ -38,6 +38,7 @@ from batch_utils.media import InputError, check_synchronized, frames_for as refe
 from batch_utils.models import runtime_event
 from batch_utils.preprocessing import human_transport
 import long_video as lv
+from segment_quality import summarize as summarize_quality
 
 JOB_ALLOWED = {'video', 'profile', 'left_wrist', 'right_wrist', 'yam32', 'instruction'}
 JOB_ID = re.compile('[A-Za-z0-9][A-Za-z0-9_.-]{0,95}')
@@ -319,7 +320,7 @@ def segment_job(backend, job, opts):
     for r in rows:
         if not (math.isfinite(r['start_s']) and math.isfinite(r['end_s']) and 0 <= r['start_s'] < r['end_s'] <= duration_s + 0.001):
             raise RuntimeError('The pipeline returned an invalid segment interval.')
-    result = dict(schema_version=SCHEMA, duration_s=duration_s, profile=canonical, camera_roles=list(paths), segments=rows, windows=windows, decode_s=round(timing['decode'], 2), timing_s={k: round(v, 2) for k, v in timing.items()}, prefetch=opts.prefetch, decoder='seek' if fast else 'reference')
+    result = dict(schema_version=SCHEMA, duration_s=duration_s, profile=canonical, camera_roles=list(paths), segments=rows, quality=summarize_quality(rows), windows=windows, decode_s=round(timing['decode'], 2), timing_s={k: round(v, 2) for k, v in timing.items()}, prefetch=opts.prefetch, decoder='seek' if fast else 'reference')
     if opts.save_raw:
         result['raw_windows'] = raw
     if len(plans) > 1:
